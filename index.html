@@ -6,6 +6,38 @@
     <title>Bhavik & Harshita Expense Tracker</title>
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <!-- Firebase -->
+    <script type="module">
+      import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+      import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, getDoc, setDoc as fsSetDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+      const firebaseConfig = {
+        apiKey: "AIzaSyCZBIflTyVEsgtmXfF0SQSDW3kPOGUAtcE",
+        authDomain: "bh-expense-tracker.firebaseapp.com",
+        projectId: "bh-expense-tracker",
+        storageBucket: "bh-expense-tracker.firebasestorage.app",
+        messagingSenderId: "474601380",
+        appId: "1:474601380:web:3c61c7d8ca9b6f43091331",
+        measurementId: "G-61MKHRQSK6"
+      };
+
+      const app = initializeApp(firebaseConfig);
+      const db = getFirestore(app);
+
+      // Expose db and helpers to global scope for the rest of the script
+      window._db = db;
+      window._col = (name) => collection(db, name);
+      window._doc = (col, id) => doc(db, col, id);
+      window._setDoc = setDoc;
+      window._deleteDoc = deleteDoc;
+      window._onSnapshot = onSnapshot;
+      window._getDoc = getDoc;
+      window._fsSetDoc = fsSetDoc;
+
+      // Signal that Firebase is ready
+      window._firebaseReady = true;
+      document.dispatchEvent(new Event('firebaseReady'));
+    </script>
     <style>
         /* ===== CSS VARIABLES ===== */
         :root {
@@ -643,6 +675,7 @@
         <aside class="sidebar" id="sidebar">
             <div class="sidebar-logo">
                 <h3>B <span class="heart">♥</span> H Finance</h3>
+                <div id="syncStatus" style="margin-top:0.4rem;text-align:center;"></div>
             </div>
             <nav class="nav-items">
                 <a class="nav-item active" href="#dashboard" data-section="dashboard">
@@ -961,32 +994,104 @@
 
     <script>
     /* ===== APP STATE ===== */
-    const STORAGE_KEY = 'bh_expenses';
-    const VACATION_KEY = 'bh_vacation_fund';
-    const ONBOARDED_KEY = 'bh_onboarded';
     const THEME_KEY = 'bh_theme';
     const BUDGET = 80000;
     const VACATION_GOAL = 50000;
     const SAVINGS_GOAL = 200000;
 
-    let expenses = JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
-    let vacationFund = parseFloat(localStorage.getItem(VACATION_KEY)) || 0;
+    let expenses = [];
+    let vacationFund = 0;
     let sortField = 'date';
     let sortDir = -1;
     let chartInstances = {};
+    let _unsubExpenses = null;
+
+    /* ===== FIREBASE HELPERS (thin wrappers so rest of code stays clean) ===== */
+    async function saveExpenseToFirebase(expense) {
+        try {
+            await window._setDoc(window._doc('expenses', expense.id), expense);
+        } catch(err) { console.error('Firebase save error:', err); showToast('Sync error – check console', '❌'); }
+    }
+
+    async function deleteExpenseFromFirebase(id) {
+        try {
+            await window._deleteDoc(window._doc('expenses', id));
+        } catch(err) { console.error('Firebase delete error:', err); showToast('Sync error – check console', '❌'); }
+    }
+
+    async function saveVacationFundToFirebase(val) {
+        try {
+            await window._setDoc(window._doc('meta', 'vacationFund'), { value: val });
+        } catch(err) { console.error('Firebase save error:', err); }
+    }
+
+    async function saveOnboardedToFirebase() {
+        try {
+            await window._setDoc(window._doc('meta', 'onboarded'), { value: true });
+        } catch(err) { console.error('Firebase save error:', err); }
+    }
 
     /* ===== INITIALIZATION ===== */
-    document.addEventListener('DOMContentLoaded', () => {
+    function initApp() {
         initTheme();
         setGreeting();
         setDefaultDate();
-        // Start fresh - no sample data loaded
-        if (!localStorage.getItem(ONBOARDED_KEY)) showOnboarding();
-        renderAll();
         initKeyboardShortcuts();
-    });
+        showSyncStatus('connecting');
 
-    /* ===== THEME ===== */
+        // Listen to expenses collection in real-time
+        _unsubExpenses = window._onSnapshot(
+            window._col('expenses'),
+            (snapshot) => {
+                expenses = snapshot.docs.map(d => d.data());
+                renderAll();
+                showSyncStatus('synced');
+            },
+            (err) => {
+                console.error('Firestore error:', err);
+                showSyncStatus('error');
+                showToast('Connection error. Check Firestore rules.', '❌');
+            }
+        );
+
+        // Load vacation fund
+        window._getDoc(window._doc('meta', 'vacationFund')).then(snap => {
+            if (snap.exists()) { vacationFund = snap.data().value || 0; renderCoupleFeatures(); }
+        });
+
+        // Onboarding check
+        window._getDoc(window._doc('meta', 'onboarded')).then(snap => {
+            if (!snap.exists()) showOnboarding();
+        });
+    }
+
+    // Wait for Firebase to be ready before init
+    if (window._firebaseReady) {
+        document.addEventListener('DOMContentLoaded', initApp);
+    } else {
+        document.addEventListener('firebaseReady', () => {
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', initApp);
+            } else {
+                initApp();
+            }
+        });
+    }
+
+    /* ===== SYNC STATUS INDICATOR ===== */
+    function showSyncStatus(state) {
+        const el = document.getElementById('syncStatus');
+        if (!el) return;
+        const states = {
+            connecting: { icon: '🔄', text: 'Connecting…', color: '#A7BED3' },
+            synced:     { icon: '☁️', text: 'Synced', color: '#6bc9a0' },
+            error:      { icon: '⚠️', text: 'Offline', color: '#e76f6f' }
+        };
+        const s = states[state] || states.synced;
+        el.innerHTML = `<span style="color:${s.color};font-size:0.75rem;display:flex;align-items:center;gap:0.3rem;">${s.icon} ${s.text}</span>`;
+    }
+
+    /* ===== THEME (kept in localStorage — personal UI preference) ===== */
     function initTheme() {
         const saved = localStorage.getItem(THEME_KEY);
         if (saved) document.documentElement.setAttribute('data-theme', saved);
@@ -1041,7 +1146,7 @@
     function showOnboarding() { document.getElementById('onboardingModal').classList.add('active'); }
     function closeOnboarding() {
         document.getElementById('onboardingModal').classList.remove('active');
-        localStorage.setItem(ONBOARDED_KEY, 'true');
+        saveOnboardedToFirebase();
     }
 
     /* ===== TOAST ===== */
@@ -1055,7 +1160,7 @@
     }
 
     /* ===== EXPENSE FORM ===== */
-    document.getElementById('expenseForm').addEventListener('submit', function(e) {
+    document.getElementById('expenseForm').addEventListener('submit', async function(e) {
         e.preventDefault();
         const expense = {
             id: Date.now().toString(),
@@ -1068,16 +1173,17 @@
             notes: document.getElementById('expNotes').value,
             recurring: document.getElementById('recurringToggle').classList.contains('active')
         };
-        expenses.push(expense);
-        saveExpenses();
-        renderAll();
+        showSyncStatus('connecting');
+        await saveExpenseToFirebase(expense);
+        // onSnapshot will update expenses[] and re-render
         this.reset();
         setDefaultDate();
         showToast('Expense added successfully!');
     });
 
     /* ===== DATA HELPERS ===== */
-    function saveExpenses() { localStorage.setItem(STORAGE_KEY, JSON.stringify(expenses)); }
+    // No-op kept for CSV import compatibility — actual saves go to Firebase individually
+    function saveExpenses() {}
 
     function getCurrentMonthExpenses() {
         const now = new Date();
@@ -1186,18 +1292,18 @@
         renderTable();
     }
 
-    function deleteExpense(id) {
-        expenses = expenses.filter(e => e.id !== id);
-        saveExpenses();
-        renderAll();
+    async function deleteExpense(id) {
+        showSyncStatus('connecting');
+        await deleteExpenseFromFirebase(id);
+        // onSnapshot will update expenses[] and re-render
         showToast('Expense deleted', '🗑️');
     }
 
-    function deleteAllExpenses() {
+    async function deleteAllExpenses() {
         if (!confirm('Are you sure you want to delete ALL expenses? This cannot be undone.')) return;
-        expenses = [];
-        saveExpenses();
-        renderAll();
+        showSyncStatus('connecting');
+        const promises = expenses.map(e => deleteExpenseFromFirebase(e.id));
+        await Promise.all(promises);
         showToast('All expenses deleted!', '🗑️');
     }
 
@@ -1415,12 +1521,12 @@
         document.getElementById('savingsGoalFill').style.width = savPct + '%';
     }
 
-    function addToVacation() {
+    async function addToVacation() {
         const input = document.getElementById('vacationInput');
         const val = parseFloat(input.value);
         if (!val || val <= 0) return;
         vacationFund += val;
-        localStorage.setItem(VACATION_KEY, vacationFund);
+        await saveVacationFundToFirebase(vacationFund);
         input.value = '';
         renderCoupleFeatures();
         showToast(`Added ${formatCurrency(val)} to vacation fund! 🏖️`);
@@ -1439,6 +1545,7 @@
 
             const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
             let imported = 0;
+            const importBatch = [];
 
             for (let i = 1; i < lines.length; i++) {
                 const cols = lines[i].split(',').map(c => c.trim());
@@ -1471,7 +1578,7 @@
 
                 if (amount > 0) {
                     const category = categorizeTransaction(description);
-                    expenses.push({
+                    const exp = {
                         id: Date.now().toString() + i,
                         date, amount, category,
                         paidBy: 'Bhavik',
@@ -1479,14 +1586,17 @@
                         splitType: 'Both',
                         notes: description.substring(0, 50),
                         recurring: false
-                    });
+                    };
+                    importBatch.push(exp);
                     imported++;
                 }
             }
 
-            saveExpenses();
-            renderAll();
-            showToast(`Imported ${imported} transactions! 📥`);
+            // Save all imported expenses to Firebase
+            showSyncStatus('connecting');
+            Promise.all(importBatch.map(exp => saveExpenseToFirebase(exp))).then(() => {
+                showToast(`Imported ${imported} transactions! 📥`);
+            });
         };
         reader.readAsText(file);
         event.target.value = '';
@@ -1610,9 +1720,12 @@
             recurring: e.category === 'Rent' || e.category === 'EMI' || e.category === 'Subscriptions'
         }));
 
-        saveExpenses();
+        showSyncStatus('connecting');
+        Promise.all(expenses.map(exp => saveExpenseToFirebase(exp))).then(() => {
+            showToast('Sample data loaded! 🎉');
+        });
         vacationFund = 12500;
-        localStorage.setItem(VACATION_KEY, vacationFund);
+        saveVacationFundToFirebase(vacationFund);
     }
     </script>
     </div><!-- end mainApp -->
